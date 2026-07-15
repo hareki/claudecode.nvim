@@ -217,6 +217,18 @@ local function cc_hide(term)
       -- Neovim does not auto-leave a config-hidden window; step out of it.
       if vim.api.nvim_get_current_win() == win then
         pcall(vim.cmd, "wincmd p")
+        -- wincmd p is a silent no-op when the previous window is gone (e.g. the
+        -- diff cleanup closed it); never leave focus inside a config-hidden window.
+        if vim.api.nvim_get_current_win() == win then
+          local ok, wins = pcall(vim.api.nvim_tabpage_list_wins, 0)
+          for _, w in ipairs(ok and wins or {}) do
+            local cfg = win_get_config(w)
+            if w ~= win and cfg and cfg.hide ~= true and (cfg.relative == nil or cfg.relative == "") then
+              vim.api.nvim_set_current_win(w)
+              break
+            end
+          end
+        end
       end
     elseif term._cc and term._cc.orig_hide then
       -- Pre-0.10 float: no config-hide available, fall back to Snacks (cursor

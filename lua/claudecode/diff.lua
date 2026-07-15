@@ -1248,6 +1248,21 @@ function M._cleanup_diff_state(tab_name, reason)
     resize_terminal_for_diff(find_claudecode_terminal_window(), "idle")
   end
 
+  -- Focus can be stranded inside a config-hidden Snacks float (parked via
+  -- nvim_win_set_config({hide=true}), see terminal/snacks.lua) when the window
+  -- closes above hand focus to it; rescue it onto a visible window.
+  local current_win = vim.api.nvim_get_current_win()
+  local cfg_ok, current_cfg = pcall(vim.api.nvim_win_get_config, current_win)
+  if not vim.api.nvim_win_is_valid(current_win) or (cfg_ok and current_cfg and current_cfg.hide == true) then
+    local fallback = diff_data.target_window
+    if not (fallback and vim.api.nvim_win_is_valid(fallback)) then
+      fallback = find_main_editor_window()
+    end
+    if fallback then
+      pcall(vim.api.nvim_set_current_win, fallback)
+    end
+  end
+
   -- ALWAYS clean up buffers regardless of tab mode (fixes buffer leak)
   -- Clean up the new buffer (proposed changes)
   if diff_data.new_buffer and vim.api.nvim_buf_is_valid(diff_data.new_buffer) then
