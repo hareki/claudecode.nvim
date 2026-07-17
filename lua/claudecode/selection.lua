@@ -501,6 +501,31 @@ local function extract_linewise_text(lines_content, start_coords)
   return table.concat(lines_content, "\n")
 end
 
+---Snaps a 1-indexed byte column back to the first byte of the multi-byte character it points
+---into, so a slice never starts mid-sequence. No-op when already on a boundary or out of range.
+---@param line string - the line the column indexes into
+---@param col number - 1-indexed byte column
+---@return number col - the byte column snapped to a character start
+local function snap_col_to_char_start(line, col)
+  if col < 1 or col > #line then
+    return col
+  end
+  return col + vim.str_utf_start(line, col)
+end
+
+---Extends a 1-indexed byte column forward to the last byte of the multi-byte character it points
+---into, so a slice includes the whole character instead of truncating it mid-sequence (which
+---would produce invalid UTF-8). No-op when the column is out of range.
+---@param line string - the line the column indexes into
+---@param col number - 1-indexed byte column
+---@return number col - the byte column extended to a character end
+local function snap_col_to_char_end(line, col)
+  if col < 1 or col > #line then
+    return col
+  end
+  return col + vim.str_utf_end(line, col)
+end
+
 ---Extracts text for characterwise visual selection
 ---@param lines_content table - array of line strings
 ---@param start_coords table - start coordinates
@@ -508,21 +533,30 @@ end
 ---@return string|nil text - the extracted text or nil if invalid
 local function extract_characterwise_text(lines_content, start_coords, end_coords)
   if start_coords.lnum == end_coords.lnum then
-    if not lines_content[1] then
+    local line = lines_content[1]
+    if not line then
       return nil
     end
-    return string.sub(lines_content[1], start_coords.col, end_coords.col)
+    -- Vim marks/cursor report the FIRST byte of a multi-byte char; snap the columns to char
+    -- boundaries so string.sub never splits a glyph (e.g. a nerdfont char) into invalid UTF-8.
+    local start_col = snap_col_to_char_start(line, start_coords.col)
+    local end_col = snap_col_to_char_end(line, end_coords.col)
+    return string.sub(line, start_col, end_col)
   else
-    if not lines_content[1] or not lines_content[#lines_content] then
+    local first_line = lines_content[1]
+    local last_line = lines_content[#lines_content]
+    if not first_line or not last_line then
       return nil
     end
 
     local text_parts = {}
-    table.insert(text_parts, string.sub(lines_content[1], start_coords.col))
+    local first_start = snap_col_to_char_start(first_line, start_coords.col)
+    local last_end = snap_col_to_char_end(last_line, end_coords.col)
+    table.insert(text_parts, string.sub(first_line, first_start))
     for i = 2, #lines_content - 1 do
       table.insert(text_parts, lines_content[i])
     end
-    table.insert(text_parts, string.sub(lines_content[#lines_content], 1, end_coords.col))
+    table.insert(text_parts, string.sub(last_line, 1, last_end))
     return table.concat(text_parts, "\n")
   end
 end

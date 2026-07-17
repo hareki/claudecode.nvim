@@ -2,6 +2,7 @@
 local frame = require("claudecode.server.frame")
 local handshake = require("claudecode.server.handshake")
 local logger = require("claudecode.logger")
+local utils = require("claudecode.server.utils")
 
 local M = {}
 
@@ -219,6 +220,17 @@ function M.send_message(client, message, callback)
   if client.state ~= "connected" then
     if callback then
       callback("Client not connected")
+    end
+    return
+  end
+
+  -- Mirror the inbound UTF-8 validation (server/frame.lua) on the outbound path: a TEXT frame
+  -- carrying invalid UTF-8 makes an RFC 6455-compliant peer reset the connection. Drop the one
+  -- offending message instead of tearing down the whole socket.
+  if not utils.is_valid_utf8(message) then
+    logger.error("client", "Dropping outbound message with invalid UTF-8 for client:", client.id)
+    if callback then
+      callback("Invalid UTF-8 in message")
     end
     return
   end
