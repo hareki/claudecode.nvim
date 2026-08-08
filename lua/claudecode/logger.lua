@@ -73,6 +73,11 @@ local function log(level, component, message_parts)
   -- Wrap all vim.notify and nvim_echo calls in vim.schedule to avoid
   -- "nvim_echo must not be called in a fast event context" errors
   vim.schedule(function()
+    -- Suppress display once Neovim is exiting: the message can no longer be
+    -- seen in the UI and would only leak onto the terminal after quit
+    if vim.v.exiting ~= vim.NIL then
+      return
+    end
     if level == M.levels.ERROR then
       vim.notify(prefix .. " " .. message, vim.log.levels.ERROR, { title = "ClaudeCode Error" })
     elseif level == M.levels.WARN then
