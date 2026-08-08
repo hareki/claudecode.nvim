@@ -81,6 +81,12 @@ local function clear_mention_queue()
     M.state.mention_timer:close()
     M.state.mention_timer = nil
   end
+
+  if M.state.connection_timer then
+    M.state.connection_timer:stop()
+    M.state.connection_timer:close()
+    M.state.connection_timer = nil
+  end
 end
 
 ---Process mentions when Claude is connected (debounced mode)
