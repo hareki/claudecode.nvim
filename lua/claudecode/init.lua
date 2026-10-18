@@ -248,7 +248,7 @@ function M.process_mention_queue(from_new_connection)
       vim.defer_fn(function()
         send_mention_sequential(1)
       end, initial_delay)
-    else
+    elseif not require("claudecode.mention_paste").paste(mentions_to_send) then
       -- Send immediately for debounced processing (Claude already connected)
       send_mention_sequential(1)
     end
@@ -1307,6 +1307,9 @@ function M._broadcast_at_mention(file_path, start_line, end_line)
     (M.state.config and M.state.config.disable_broadcast_debouncing)
     or (package.loaded["busted"] and not (M.state.config and M.state.config.enable_broadcast_debouncing_in_tests))
   then
+    if require("claudecode.mention_paste").paste({ sent }) then
+      return true, nil, sent
+    end
     local broadcast_success = M.state.server.broadcast("at_mentioned", params)
     if broadcast_success then
       return true, nil, sent
