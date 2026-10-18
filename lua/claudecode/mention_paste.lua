@@ -59,8 +59,9 @@ function M.paste(mentions)
   end
 
   -- Claude pads its own insertion with a leading space unless the character before the cursor is
-  -- whitespace; the prompt is not observable from here, so always pad.
-  local text = " " .. table.concat(mention_texts, " ") .. " "
+  -- whitespace. The prompt is not observable from here, so there is no leading pad: an unconditional
+  -- one doubles the space users type before a mention. The trailing pad separates the next mention.
+  local text = table.concat(mention_texts, " ") .. " "
   -- Wrapped here because send_to_terminal only pastes multi-line text: a single line would be typed
   -- as keystrokes, which vim-mode NORMAL runs as commands.
   return terminal.send_to_terminal("\27[200~" .. text .. "\27[201~", { submit = false })
