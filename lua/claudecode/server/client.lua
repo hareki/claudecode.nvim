@@ -6,6 +6,10 @@ local utils = require("claudecode.server.utils")
 
 local M = {}
 
+-- Diffs remember the id of the client that opened them after it disconnects, so an id must never
+-- come back. A handle's address can: libuv reuses the memory of a collected handle.
+local clients_created = 0
+
 ---@class WebSocketClient
 ---@field id string Unique client identifier
 ---@field tcp_handle table The vim.loop TCP handle
@@ -19,7 +23,8 @@ local M = {}
 ---@param tcp_handle table The vim.loop TCP handle
 ---@return WebSocketClient client The client object
 function M.create_client(tcp_handle)
-  local client_id = tostring(tcp_handle):gsub("userdata: ", "client_")
+  clients_created = clients_created + 1
+  local client_id = "client_" .. clients_created
 
   local client = {
     id = client_id,

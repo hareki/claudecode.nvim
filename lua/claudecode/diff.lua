@@ -452,36 +452,33 @@ end
 ---@param filename string Base filename for the temporary file
 ---@return string? path, string? error The temporary file path and error message
 local function create_temp_file(content, filename)
-  local base_dir_cache = vim.fn.stdpath("cache") .. "/claudecode_diffs"
-  local mkdir_ok_cache, mkdir_err_cache = pcall(vim.fn.mkdir, base_dir_cache, "p")
-
-  local final_base_dir
-  if mkdir_ok_cache then
-    final_base_dir = base_dir_cache
-  else
-    local base_dir_temp = vim.fn.stdpath("cache") .. "/claudecode_diffs_fallback"
-    local mkdir_ok_temp, mkdir_err_temp = pcall(vim.fn.mkdir, base_dir_temp, "p")
-    if not mkdir_ok_temp then
-      local err_to_report = mkdir_err_temp or mkdir_err_cache or "unknown error creating base temp dir"
-      return nil, "Failed to create base temporary directory: " .. tostring(err_to_report)
-    end
-    final_base_dir = base_dir_temp
-  end
-
+  -- tempname()'s tail is a per-process counter, so the PID keeps folders of concurrent Neovim processes apart.
   local session_id_base = vim.fn.fnamemodify(vim.fn.tempname(), ":t")
     .. "_"
     .. tostring(os.time())
     .. "_"
-    .. tostring(math.random(1000, 9999))
+    .. tostring(vim.fn.getpid())
   local session_id = session_id_base:gsub("[^A-Za-z0-9_-]", "")
   if session_id == "" then -- Fallback if all characters were problematic, ensuring a directory can be made.
     session_id = "claudecode_session"
   end
 
-  local tmp_session_dir = final_base_dir .. "/" .. session_id
-  local mkdir_session_ok, mkdir_session_err = pcall(vim.fn.mkdir, tmp_session_dir, "p")
-  if not mkdir_session_ok then
-    return nil, "Failed to create temporary session directory: " .. tostring(mkdir_session_err)
+  local cache_dir = vim.fn.stdpath("cache")
+  local tmp_session_dir
+  local failures = {}
+  for _, base_dir in ipairs({ cache_dir .. "/claudecode_diffs", cache_dir .. "/claudecode_diffs_fallback" }) do
+    local candidate = base_dir .. "/" .. session_id
+    -- mkdir() raises E739 on failure, but under :silent! it returns 0 instead.
+    local mkdir_ok, mkdir_result = pcall(vim.fn.mkdir, candidate, "p")
+    if mkdir_ok and mkdir_result == 1 then
+      tmp_session_dir = candidate
+      break
+    end
+    local reason = mkdir_ok and ("mkdir() returned " .. tostring(mkdir_result)) or tostring(mkdir_result)
+    table.insert(failures, base_dir .. " (" .. reason .. ")")
+  end
+  if not tmp_session_dir then
+    return nil, "Failed to create a temporary diff directory in " .. table.concat(failures, " or ")
   end
 
   local tmp_file = tmp_session_dir .. "/" .. filename
@@ -499,46 +496,12 @@ end
 ---Clean up temporary files and directories
 ---@param tmp_file string Path to the temporary file to clean up
 local function cleanup_temp_file(tmp_file)
-  if tmp_file and vim.fn.filereadable(tmp_file) == 1 then
-    local tmp_dir = vim.fn.fnamemodify(tmp_file, ":h")
-    if vim.fs and type(vim.fs.remove) == "function" then
-      local ok_file, err_file = pcall(vim.fs.remove, tmp_file)
-      if not ok_file then
-        vim.notify(
-          "ClaudeCode: Error removing temp file " .. tmp_file .. ": " .. tostring(err_file),
-          vim.log.levels.WARN
-        )
-      end
-
-      local ok_dir, err_dir = pcall(vim.fs.remove, tmp_dir)
-      if not ok_dir then
-        vim.notify(
-          "ClaudeCode: Error removing temp directory " .. tmp_dir .. ": " .. tostring(err_dir),
-          vim.log.levels.INFO
-        )
-      end
-    else
-      local reason = "vim.fs.remove is not a function"
-      if not vim.fs then
-        reason = "vim.fs is nil"
-      end
-      vim.notify(
-        "ClaudeCode: Cannot perform standard cleanup: "
-          .. reason
-          .. ". Affected file: "
-          .. tmp_file
-          .. ". Please check your Neovim setup or report this issue.",
-        vim.log.levels.ERROR
-      )
-      -- Fallback to os.remove for the file.
-      local os_ok, os_err = pcall(os.remove, tmp_file)
-      if not os_ok then
-        vim.notify(
-          "ClaudeCode: Fallback os.remove also failed for file " .. tmp_file .. ": " .. tostring(os_err),
-          vim.log.levels.ERROR
-        )
-      end
-    end
+  local tmp_dir = vim.fn.fnamemodify(tmp_file, ":h")
+  if vim.fn.filereadable(tmp_file) == 1 and vim.fn.delete(tmp_file) ~= 0 then
+    vim.notify("ClaudeCode: Error removing temp file " .. tmp_file, vim.log.levels.WARN)
+  end
+  if vim.fn.isdirectory(tmp_dir) == 1 and vim.fn.delete(tmp_dir, "d") ~= 0 then
+    vim.notify("ClaudeCode: Error removing temp directory " .. tmp_dir, vim.log.levels.WARN)
   end
 end
 
@@ -802,11 +765,16 @@ function M._open_native_diff(old_file_path, new_file_path, new_file_contents, ta
   vim.cmd("diffthis")
 
   local cleanup_group = vim.api.nvim_create_augroup("ClaudeCodeDiffCleanup", { clear = false })
+  local cleaned_up = false
   vim.api.nvim_create_autocmd({ "BufDelete", "BufWipeout" }, {
     group = cleanup_group,
     buffer = new_buf,
     callback = function()
-      cleanup_temp_file(tmp_file)
+      -- Wiping the buffer fires both events, and once = true applies to each event separately.
+      if not cleaned_up then
+        cleaned_up = true
+        cleanup_temp_file(tmp_file)
+      end
     end,
     once = true,
   })
@@ -1591,6 +1559,16 @@ function M._setup_blocking_diff(params, resolution_callback)
   end
 end
 
+---True when the user accepted this diff for a different Claude client. The accepted edits live
+---only in the proposed buffer until that client writes the file, so no other client may tear the
+---diff down: if the owner died first, nothing else holds the edits.
+---@param diff_data table An active_diffs entry
+---@param client_id string|nil The client that asks to close or replace the diff
+---@return boolean
+local function holds_edits_for_other_client(diff_data, client_id)
+  return diff_data.status == "saved" and diff_data.client_id ~= nil and diff_data.client_id ~= client_id
+end
+
 ---Blocking diff operation for MCP compliance
 ---@param old_file_path string Path to the original file
 ---@param new_file_path string Path to the new file (used for naming)
@@ -1602,6 +1580,13 @@ function M.open_diff_blocking(old_file_path, new_file_path, new_file_contents, t
   -- Check for existing diff with same tab_name
   if active_diffs[tab_name] then
     local existing_diff = active_diffs[tab_name]
+    if holds_edits_for_other_client(existing_diff, client_id) then
+      error({
+        code = -32000,
+        message = "Diff tab in use",
+        data = "tab_name " .. tab_name .. " holds edits the user accepted for another Claude session",
+      })
+    end
     -- Resolve the existing diff as rejected before replacing, but only if it was still pending.
     if existing_diff.status == "pending" then
       M._resolve_diff_as_rejected(tab_name)
@@ -1622,6 +1607,12 @@ function M.open_diff_blocking(old_file_path, new_file_path, new_file_contents, t
 
   logger.debug("diff", "Starting diff setup for", tab_name)
 
+  -- A ClaudeCodeDiffOpened handler can accept or deny the diff before this coroutine yields
+  -- (issue #325). The coroutine cannot be resumed then, and the server has no response sender
+  -- for it yet, so keep that result and return it as the immediate reply instead of yielding.
+  local waiting = false
+  local setup_result = nil
+
   -- Use native diff implementation
   local success, err = pcall(M._setup_blocking_diff, {
     old_file_path = old_file_path,
@@ -1630,30 +1621,25 @@ function M.open_diff_blocking(old_file_path, new_file_path, new_file_contents, t
     tab_name = tab_name,
     client_id = client_id,
   }, function(result)
+    if not waiting then
+      setup_result = result
+      return
+    end
     -- Resume the coroutine with the result
-    local resume_success, resume_result = coroutine.resume(co, result)
-    if resume_success then
-      -- Use the global response sender to avoid module reloading issues
-      local co_key = tostring(co)
-      if _G.claude_deferred_responses and _G.claude_deferred_responses[co_key] then
-        _G.claude_deferred_responses[co_key](resume_result)
-        _G.claude_deferred_responses[co_key] = nil
-      else
-        logger.error("diff", "No global response sender found for coroutine:", co_key)
-      end
-    else
+    local resume_success, resume_result, resume_err = coroutine.resume(co, result)
+    if not resume_success then
       logger.error("diff", "Coroutine failed:", tostring(resume_result))
-      local co_key = tostring(co)
-      if _G.claude_deferred_responses and _G.claude_deferred_responses[co_key] then
-        _G.claude_deferred_responses[co_key]({
-          error = {
-            code = -32603,
-            message = "Internal error",
-            data = "Coroutine failed: " .. tostring(resume_result),
-          },
-        })
-        _G.claude_deferred_responses[co_key] = nil
-      end
+    end
+    -- The coroutine runs the tool handler, so its outcome maps like an immediate reply.
+    -- The sender takes the MCP result itself or `{ error = ... }`.
+    local response = require("claudecode.tools.init").build_response(resume_success, resume_result, resume_err)
+    -- Use the global response sender to avoid module reloading issues
+    local co_key = tostring(co)
+    if _G.claude_deferred_responses and _G.claude_deferred_responses[co_key] then
+      _G.claude_deferred_responses[co_key](response.error and response or response.result)
+      _G.claude_deferred_responses[co_key] = nil
+    else
+      logger.error("diff", "No global response sender found for coroutine:", co_key)
     end
   end)
 
@@ -1680,7 +1666,12 @@ function M.open_diff_blocking(old_file_path, new_file_path, new_file_contents, t
     end
   end
 
+  if setup_result then
+    return setup_result
+  end
+
   -- Yield and wait indefinitely for user interaction - the resolve functions will resume us
+  waiting = true
   local user_action_result = coroutine.yield()
   -- Return the result directly - this will be sent by the deferred response system
   return user_action_result
@@ -1696,10 +1687,17 @@ vim.api.nvim_create_autocmd("VimLeavePre", {
 
 ---Close diff by tab name (used by close_tab tool)
 ---@param tab_name string The diff identifier
+---@param client_id string|nil The Claude client that asks for the close (close_tab, closeAllDiffTabs).
+---  The plugin's own bulk closes pass nil, and their filters decide.
 ---@return boolean success True if diff was found and closed
-function M.close_diff_by_tab_name(tab_name)
+function M.close_diff_by_tab_name(tab_name, client_id)
   local diff_data = active_diffs[tab_name]
   if not diff_data then
+    return false
+  end
+
+  if client_id and holds_edits_for_other_client(diff_data, client_id) then
+    logger.debug("diff", "Keeping", tab_name, "for the client that owns it:", diff_data.client_id)
     return false
   end
 
@@ -1738,19 +1736,25 @@ end
 ---(resuming their coroutine) before tearing down the UI.
 ---@param filter_fn (fun(diff_data: table): boolean)|nil Only close diffs for which this returns true (nil = all)
 ---@param reason string Human-readable reason (for logging)
+---@param client_id string|nil The Claude client that asks for the close, passed to close_diff_by_tab_name
 ---@return number count Number of diffs closed
-local function close_active_diffs(filter_fn, reason)
+local function close_active_diffs(filter_fn, reason, client_id)
+  local function matches(diff_data)
+    return diff_data ~= nil and (not filter_fn or filter_fn(diff_data))
+  end
   local count = 0
   -- Snapshot the tab names first: close_diff_by_tab_name nils out entries as it
   -- goes, and mutating a table while iterating it with pairs() is undefined.
   local tab_names = {}
   for tab_name, diff_data in pairs(active_diffs) do
-    if not filter_fn or filter_fn(diff_data) then
+    if matches(diff_data) then
       tab_names[#tab_names + 1] = tab_name
     end
   end
   for _, tab_name in ipairs(tab_names) do
-    if M.close_diff_by_tab_name(tab_name) then
+    -- Each close fires ClaudeCodeDiffClosed synchronously, and a user handler can
+    -- accept a later entry, so recheck the filter against the entry as it is now.
+    if matches(active_diffs[tab_name]) and M.close_diff_by_tab_name(tab_name, client_id) then
       count = count + 1
     end
   end
@@ -1763,13 +1767,16 @@ end
 ---Close all active diffs, resolving any still pending as rejected.
 ---Closes diffs in ANY state (including saved), so its only caller is the
 ---closeAllDiffTabs tool, where Claude is the connected client and has written
----accepted files. Automatic cleanup and the :ClaudeCodeCloseAllDiffs command
----deliberately use close_pending_diffs / close_diffs_for_client instead, to
----leave already-saved diffs alone -- see close_pending_diffs for why.
+---its accepted files. A saved diff that belongs to another client stays open:
+---that client has not written it yet. Automatic cleanup and the
+---:ClaudeCodeCloseAllDiffs command deliberately use close_pending_diffs /
+---close_diffs_for_client instead, to leave already-saved diffs alone -- see
+---close_pending_diffs for why.
 ---@param reason string Human-readable reason (for logging)
+---@param client_id string|nil The Claude client that called closeAllDiffTabs
 ---@return number count Number of diffs closed
-function M.close_all_diffs(reason)
-  return close_active_diffs(nil, reason or "close all diffs")
+function M.close_all_diffs(reason, client_id)
+  return close_active_diffs(nil, reason or "close all diffs", client_id)
 end
 
 -- Automatic teardown (client disconnect, server stop) must only touch *pending*

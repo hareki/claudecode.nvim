@@ -2,6 +2,22 @@ require("tests.busted_setup") -- Ensure test helpers are loaded
 
 describe("Tool: open_file", function()
   local open_file_handler
+  local buffer_lines
+  local marks
+  local coladds
+  local original_buf_is_loaded
+  local edit_buffers
+  local cursor
+  local editor_mode
+  local gv_mode
+  local original_get_mode
+  local typed_over_selection
+  local call_win
+  local last_visual
+  local operated_on
+  local typeahead
+  local original_feedkeys
+  local original_replace_termcodes
 
   before_each(function()
     -- Reset mocks and require the module under test
@@ -25,8 +41,50 @@ describe("Tool: open_file", function()
     _G.vim.fn.fnameescape = spy.new(function(path)
       return path -- Simple pass-through
     end)
+    -- Like Neovim, gv reselects in the buffer's last Visual mode (v, V or CTRL-V), as Select mode when 'selectmode'
+    -- has "cmd" (gv_mode "s"). <Esc> ends Visual or Select mode, and so does :edit in the current window. In Select
+    -- mode any other typed key replaces the selected text. A pending operator (mode "no") acts on what gv selects.
+    editor_mode = "n"
+    gv_mode = "v"
+    last_visual = "v"
+    typed_over_selection = {}
+    operated_on = {}
+    call_win = nil
+    local kind_of = { v = "v", s = "v", V = "V", S = "V", ["\22"] = "\22", ["\19"] = "\22" }
+    local select_of = { v = "s", V = "S", ["\22"] = "\19" }
     _G.vim.cmd = spy.new(function(command)
       table.insert(_G.vim.cmd_history, command)
+      local keys = command:match("^normal! (.*)")
+      local in_visual = kind_of[editor_mode] ~= nil
+      if keys and keys ~= "\27" and editor_mode:match("^[sS\19]") then
+        table.insert(typed_over_selection, keys)
+        editor_mode = "n"
+      elseif keys == "gv" and editor_mode:match("^no") then
+        table.insert(operated_on, "gv")
+        editor_mode = "n"
+      elseif keys == "gv" then
+        editor_mode = gv_mode == "s" and select_of[last_visual] or last_visual
+      elseif command == "noautocmd normal! v\27" and editor_mode == "n" then
+        last_visual = "v"
+      elseif in_visual and (keys == "\27" or (command:match("^p?edit ") and (call_win == nil or call_win == 1000))) then
+        last_visual = kind_of[editor_mode]
+        editor_mode = "n"
+      end
+    end)
+    -- Like Neovim, keys fed with the "i" flag go before keys the user types next. A pending operator takes the
+    -- next key as its motion and acts from where the user typed the operator, unless that key is <Esc>.
+    typeahead = {}
+    original_feedkeys = _G.vim.api.nvim_feedkeys
+    original_replace_termcodes = _G.vim.api.nvim_replace_termcodes
+    _G.vim.api.nvim_replace_termcodes = spy.new(function(str)
+      return (str:gsub("<Esc>", "\27"))
+    end)
+    _G.vim.api.nvim_feedkeys = spy.new(function(keys, flags, escape_ks)
+      table.insert(typeahead, flags:find("i", 1, true) and 1 or #typeahead + 1, keys)
+    end)
+    original_get_mode = _G.vim.api.nvim_get_mode
+    _G.vim.api.nvim_get_mode = spy.new(function()
+      return { mode = editor_mode, blocking = false }
     end)
 
     -- Mock vim.json.encode
@@ -52,7 +110,11 @@ describe("Tool: open_file", function()
       return false -- No window is in diff mode by default
     end)
     _G.vim.api.nvim_win_call = spy.new(function(win, callback)
-      return callback() -- Just execute the callback
+      local outer = call_win
+      call_win = win
+      local result = callback()
+      call_win = outer
+      return result
     end)
     _G.vim.api.nvim_set_current_win = spy.new(function(win)
       -- Do nothing
@@ -67,23 +129,72 @@ describe("Tool: open_file", function()
       return "test.txt" -- Mock buffer name
     end)
     _G.vim.api.nvim_buf_line_count = spy.new(function(buf)
-      return 10 -- Mock line count
+      return #buffer_lines
     end)
+    buffer_lines = {
+      "local function test()",
+      "  print('hello')",
+      "  return true",
+      "end",
+    }
+    marks = {}
+    coladds = {}
+    -- Like Neovim, marks and the cursor take a 1-based row and a 0-based column. Like Neovim 0.8,
+    -- nvim_buf_set_mark also sets the mark's coladd to the column.
     _G.vim.api.nvim_buf_set_mark = spy.new(function(buf, name, line, col, opts)
-      -- Mock mark setting
+      if line > #buffer_lines then
+        error("Invalid 'line': out of range")
+      end
+      marks[name] = { line, col }
+      coladds[name] = col
+      return true
+    end)
+    _G.vim.fn.setpos = spy.new(function(expr, pos)
+      if pos[2] < 1 or pos[2] > #buffer_lines then
+        return -1
+      end
+      marks[expr:sub(2)] = { pos[2], pos[3] - 1 }
+      coladds[expr:sub(2)] = pos[4]
+      return 0
+    end)
+    original_buf_is_loaded = _G.vim.api.nvim_buf_is_loaded
+    _G.vim.api.nvim_buf_is_loaded = spy.new(function(buf)
+      return true
+    end)
+    -- bufexists() and bufadd() find the buffer that :edit would reuse for a path, by name or cached inode.
+    edit_buffers = {}
+    _G.vim.fn.bufexists = spy.new(function(path)
+      return edit_buffers[path] and 1 or 0
+    end)
+    _G.vim.fn.bufadd = spy.new(function(path)
+      return assert(edit_buffers[path], "bufadd would create a buffer for " .. path)
+    end)
+    _G.vim.fn.readfile = spy.new(function(path, flags, max)
+      local read = {}
+      for line_nr = 1, math.min(max or #buffer_lines, #buffer_lines) do
+        read[line_nr] = buffer_lines[line_nr]
+      end
+      return read
     end)
     _G.vim.api.nvim_buf_get_lines = spy.new(function(buf, start, end_line, strict)
-      -- Mock buffer lines for search
-      return {
-        "local function test()",
-        "  print('hello')",
-        "  return true",
-        "end",
-      }
+      if end_line < 0 then
+        end_line = #buffer_lines + end_line + 1
+      end
+      local slice = {}
+      for line_nr = start + 1, math.min(end_line, #buffer_lines) do
+        slice[#slice + 1] = buffer_lines[line_nr]
+      end
+      return slice
     end)
+    cursor = nil
     _G.vim.api.nvim_win_set_cursor = spy.new(function(win, pos)
-      -- Mock cursor setting
+      if pos[1] < 1 or pos[1] > #buffer_lines then
+        error("Invalid cursor line: out of range")
+      end
+      cursor = { pos[1], pos[2] }
     end)
+    _G.vim.o = _G.vim.o or {}
+    _G.vim.o.selection = "inclusive"
   end)
 
   after_each(function()
@@ -93,6 +204,15 @@ describe("Tool: open_file", function()
     _G.vim.fn.fnameescape = nil
     _G.vim.cmd = nil
     _G.vim.cmd_history = nil
+    _G.vim.fn.setpos = nil
+    _G.vim.fn.readfile = nil
+    _G.vim.fn.bufexists = nil
+    _G.vim.fn.bufadd = nil
+    _G.vim.api.nvim_buf_is_loaded = original_buf_is_loaded
+    _G.vim.api.nvim_get_mode = original_get_mode
+    _G.vim.api.nvim_feedkeys = original_feedkeys
+    _G.vim.api.nvim_replace_termcodes = original_replace_termcodes
+    _G.vim.o.selection = nil
   end)
 
   it("should error if filePath parameter is missing", function()
@@ -304,22 +424,250 @@ describe("Tool: open_file", function()
     -- Preview mode affects window behavior but basic functionality should work
   end)
 
-  it("should handle line selection parameters", function()
-    -- Mock additional functions needed for line selection
-    _G.vim.api.nvim_win_set_cursor = spy.new(function(win, pos)
-      -- Mock cursor setting
-    end)
-    _G.vim.fn.setpos = spy.new(function(mark, pos)
-      -- Mock position setting
+  describe("selection marks", function()
+    before_each(function()
+      buffer_lines = { "one", "two", "three", "four", "alpha beta gamma" }
     end)
 
-    local params = { filePath = "test.txt", startLine = 5, endLine = 10 }
-    local success, result = pcall(open_file_handler, params)
+    -- Neovim reads the keys waiting in typeahead as soon as the handler returns, then the keys the user types.
+    local function read_typeahead()
+      while #typeahead > 0 do
+        local next_key = table.remove(typeahead, 1)
+        if editor_mode:match("^no") then
+          if next_key ~= "\27" then
+            table.insert(operated_on, next_key)
+          end
+          editor_mode = "n"
+        end
+      end
+    end
 
-    expect(success).to_be_true()
-    expect(result.content).to_be_table()
-    expect(result.content[1].type).to_be("text")
-    expect(result.content[1].text).to_be("Opened file and selected lines 5 to 10")
+    local function user_types(key)
+      table.insert(typeahead, key)
+      read_typeahead()
+    end
+
+    local function open(params)
+      params.filePath = "test.txt"
+      local success, result = pcall(open_file_handler, params)
+      expect(success).to_be_true()
+      read_typeahead()
+      return result.content[1].text
+    end
+
+    it("selects startLine through endLine as 1-based line numbers", function()
+      expect(open({ startLine = 3, endLine = 4 })).to_be("Opened file and selected lines 3 to 4")
+      assert.are.same({ 3, 0 }, marks["<"])
+      assert.are.same({ 4, 3 }, marks[">"])
+      expect(_G.vim.cmd_history[#_G.vim.cmd_history]).to_be("normal! gv")
+    end)
+
+    it("rejects a line below 1, a fractional or false line, or endLine below startLine before opening", function()
+      for _, lines in ipairs({
+        { startLine = false },
+        { startLine = false, endLine = 3 },
+        { startLine = 2, endLine = false },
+        { startLine = 0 },
+        { startLine = 2, endLine = 0 },
+        { startLine = 1.5 },
+        { startLine = 4, endLine = 3 },
+      }) do
+        _G.vim.cmd_history = {}
+        lines.filePath = "test.txt"
+        local success, err = pcall(open_file_handler, lines)
+        expect(success).to_be_false()
+        expect(err.code).to_be(-32602)
+        expect(#_G.vim.cmd_history).to_be(0)
+      end
+    end)
+
+    it("clamps an endLine past the end of the file to the last line and reports the clamped range", function()
+      expect(open({ startLine = 4, endLine = 9 })).to_be("Opened file and selected lines 4 to 5")
+      assert.are.same({ 4, 0 }, marks["<"])
+      assert.are.same({ 5, 15 }, marks[">"])
+    end)
+
+    it("rejects a startLine past the end of the file before opening it", function()
+      _G.vim.cmd_history = {}
+      local success, err = pcall(open_file_handler, { filePath = "test.txt", startLine = 6 })
+      expect(success).to_be_false()
+      expect(err.code).to_be(-32602)
+      expect(#_G.vim.cmd_history).to_be(0)
+    end)
+
+    it("accepts a startLine that exists only in the unsaved lines of the loaded buffer", function()
+      edit_buffers["test.txt"] = 1
+      _G.vim.fn.readfile = spy.new(function(path, flags, max)
+        return { "one", "two" }
+      end)
+      expect(open({ startLine = 4, endLine = 5 })).to_be("Opened file and selected lines 4 to 5")
+    end)
+
+    it("uses the file on disk when :edit would not reuse a loaded buffer", function()
+      -- For example a buffer loaded through a symlink that was retargeted since: Neovim keeps the old inode.
+      _G.vim.fn.readfile = spy.new(function(path, flags, max)
+        return { "one", "two" }
+      end)
+      local success, err = pcall(open_file_handler, { filePath = "test.txt", startLine = 4 })
+      expect(success).to_be_false()
+      expect(err.code).to_be(-32602)
+    end)
+
+    it("keeps the end mark on an empty endLine", function()
+      buffer_lines = { "abc", "", "xyz" }
+      expect(open({ startLine = 1, endLine = 2 })).to_be("Opened file and selected lines 1 to 2")
+      assert.are.same({ 2, 0 }, marks[">"])
+    end)
+
+    it("sets both marks with no column offset on every path", function()
+      for _, params in ipairs({
+        { startLine = 3, endLine = 4 },
+        { startText = "two", endText = "three" },
+        { startText = "three" },
+      }) do
+        coladds = {}
+        open(params)
+        assert.are.same({ ["<"] = 0, [">"] = 0 }, coladds)
+      end
+    end)
+
+    it("selects the whole first line for startLine = 1", function()
+      expect(open({ startLine = 1 })).to_be("Opened file and selected lines 1 to 1")
+      assert.are.same({ 1, 0 }, marks["<"])
+      assert.are.same({ 1, 2 }, marks[">"])
+    end)
+
+    it("selects from the startText match through the last character of the endText match", function()
+      expect(open({ startText = "two", endText = "three" })).to_be(
+        'Opened file and selected text from "two" to "three"'
+      )
+      assert.are.same({ 2, 0 }, marks["<"])
+      assert.are.same({ 3, 4 }, marks[">"])
+    end)
+
+    it("ends a mid-line endText selection on the match, not the character after it", function()
+      expect(open({ startText = "alpha", endText = "beta" })).to_be(
+        'Opened file and selected text from "alpha" to "beta"'
+      )
+      assert.are.same({ 5, 0 }, marks["<"])
+      assert.are.same({ 5, 9 }, marks[">"])
+    end)
+
+    it("ends on an endText match after startText, not one earlier on the same line", function()
+      buffer_lines = { "end -- start of block", "  body", "end" }
+      expect(open({ startText = "start", endText = "end" })).to_be(
+        'Opened file and selected text from "start" to "end"'
+      )
+      assert.are.same({ 1, 7 }, marks["<"])
+      assert.are.same({ 3, 2 }, marks[">"])
+    end)
+
+    it("ends a selectToEndOfLine selection on the last character, not on the line break", function()
+      open({ startText = "two", endText = "three", selectToEndOfLine = true })
+      assert.are.same({ 2, 0 }, marks["<"])
+      assert.are.same({ 3, 4 }, marks[">"])
+    end)
+
+    it("puts the end mark one past the last character when 'selection' is exclusive", function()
+      _G.vim.o.selection = "exclusive"
+      open({ startLine = 3, endLine = 4 })
+      assert.are.same({ 4, 4 }, marks[">"])
+      open({ startText = "alpha", endText = "beta" })
+      assert.are.same({ 5, 10 }, marks[">"])
+      open({ startText = "three" })
+      assert.are.same({ 3, 5 }, marks[">"])
+    end)
+
+    it("only places the cursor when one call selects lines and then misses endText", function()
+      for _, mode in ipairs({ "v", "s" }) do
+        gv_mode = mode
+        local text = open({ startLine = 3, endLine = 4, startText = "two", endText = "zzz" })
+        assert_contains(text, 'Opened file and positioned at "two"')
+        expect(editor_mode).to_be("n")
+        assert.are.same({ 2, 0 }, cursor)
+      end
+    end)
+
+    it("never types over a selection that gv starts in Select mode", function()
+      gv_mode = "s"
+      for _, case in ipairs({
+        { params = { startText = "two", endText = "three" }, mode = "s" },
+        { params = { startText = "three" }, mode = "s" },
+        { params = { startLine = 3, endLine = 4 }, mode = "s" },
+        { params = { startLine = 3, endLine = 4, startText = "two", endText = "three" }, mode = "s" },
+        { params = { startLine = 3, endLine = 4, startText = "two", endText = "zzz" }, mode = "n" },
+      }) do
+        open(case.params)
+        assert.are.same({}, typed_over_selection)
+        expect(editor_mode).to_be(case.mode)
+      end
+    end)
+
+    it("leaves a Select mode the user holds in another window before gv", function()
+      _G.vim.api.nvim_list_wins = spy.new(function()
+        return { 2000 }
+      end)
+      editor_mode = "s"
+      expect(open({ startLine = 3, endLine = 4 })).to_be("Opened file and selected lines 3 to 4")
+      assert.are.same({}, typed_over_selection)
+      expect(editor_mode).to_be("v")
+    end)
+
+    it("selects charwise after a linewise or blockwise Visual mode in the buffer", function()
+      for _, case in ipairs({
+        { last = "V", mode = "n", gv = "v", want = "v" },
+        { last = "\22", mode = "n", gv = "v", want = "v" },
+        { last = "v", mode = "V", gv = "v", want = "v" },
+        { last = "v", mode = "S", gv = "s", want = "s" },
+        { last = "\22", mode = "n", gv = "s", want = "s" },
+      }) do
+        last_visual, editor_mode, gv_mode = case.last, case.mode, case.gv
+        open({ startText = "two", endText = "three" })
+        expect(editor_mode).to_be(case.want)
+        assert.are.same({}, typed_over_selection)
+      end
+    end)
+
+    it("only places the cursor while an operator is pending", function()
+      for _, case in ipairs({
+        { params = { startText = "two", endText = "three" }, cursor = { 2, 0 }, text = 'positioned at "two"' },
+        { params = { startText = "two" }, cursor = { 2, 0 }, text = 'positioned at "two"' },
+        { params = { startLine = 2, endLine = 3 }, cursor = { 2, 0 }, text = "positioned at line 2" },
+      }) do
+        editor_mode = "no"
+        local text = open(case.params)
+        assert_contains(text, case.text)
+        assert_contains(text, "a pending operator was cancelled and nothing was selected")
+        assert.are.same({}, operated_on)
+        expect(editor_mode).to_be("n")
+        assert.are.same(case.cursor, cursor)
+      end
+    end)
+
+    it("cancels a pending operator before the user's next key", function()
+      for _, params in ipairs({ { startText = "two", endText = "three" }, { startLine = 4 } }) do
+        editor_mode, typeahead = "no", {}
+        open(params)
+        user_types("w")
+        assert.are.same({}, operated_on)
+        expect(editor_mode).to_be("n")
+      end
+    end)
+
+    it("selects only the startText match when there is no endText", function()
+      expect(open({ startText = "three" })).to_be('Opened file and selected text "three"')
+      assert.are.same({ 3, 0 }, marks["<"])
+      assert.are.same({ 3, 4 }, marks[">"])
+    end)
+
+    it("puts the cursor on the startText match without a selection when endText is not found", function()
+      assert_contains(open({ startText = "two", endText = "zzz" }), 'Opened file and positioned at "two"')
+      assert.are.same({ 2, 0 }, cursor)
+      assert.are.same({}, marks)
+      for _, command in ipairs(_G.vim.cmd_history) do
+        expect(command == "normal! gv").to_be_false()
+      end
+    end)
   end)
 
   it("should handle text pattern selection when pattern found", function()
