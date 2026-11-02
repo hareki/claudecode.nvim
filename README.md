@@ -230,7 +230,7 @@ Configure the plugin with the detected path:
 - `:ClaudeCodeAdd <file-path> [start-line] [end-line]` - Add specific file to Claude context with optional line range
 - `:ClaudeCodeDiffAccept` - Accept diff changes
 - `:ClaudeCodeDiffDeny` - Reject diff changes
-- `:ClaudeCodeCloseAllDiffs` - Close pending Claude diffs (leaves accepted/saved diffs intact)
+- `:ClaudeCodeCloseAllDiffs` - Close Claude diffs: rejects pending ones, closes rejected ones, and closes accepted ones once the file or its buffer holds the accepted text
 
 ## Sending text to the Claude terminal
 
@@ -253,7 +253,9 @@ When Claude proposes changes, the plugin opens a native Neovim diff view:
 
 You can edit Claude's suggestions before accepting them.
 
-If a diff is resolved outside this Neovim (for example via Claude remote control on another device) the diff windows would otherwise stay open. They are now closed automatically when the Claude session that opened them disconnects. If you resolve diffs remotely while the session is still connected, run `:ClaudeCodeCloseAllDiffs` to clear the leftover pending proposals — it leaves any diff you have already accepted (`:w`) but whose file has not been written yet untouched, so your saved edits are never discarded.
+If a diff is resolved outside this Neovim (for example via Claude remote control on another device) the diff windows would otherwise stay open. They are now closed automatically when the Claude session that opened them disconnects. If you resolve diffs remotely while the session is still connected, run `:ClaudeCodeCloseAllDiffs` to clear the leftover pending proposals.
+
+A diff you accepted with `:w` stays open until Claude writes the file and closes it. If that Claude session exits or stops before it writes the file, `:ClaudeCodeCloseAllDiffs` finishes the diff. When the file does not hold the accepted text yet, the command puts the text into the file's buffer as unsaved changes and closes the diff: `:w` in that buffer writes it (`:checktime`, then `:w!` for a read-only file, so Neovim still warns about a change on disk, `:w ++p` for a new file whose folder does not exist yet, or on Neovim 0.8 `:call mkdir(expand('%:p:h'), 'p') | w`), and `:e!` drops it. The plugin never writes the file. In a CRLF file, `:w` writes every line break as CRLF, with one CR each, whether Claude's text had CRLF, LF, or both. A file with a BOM keeps one BOM. In any other file, `:w` writes the text's own line endings and BOM. When the buffer's `'fileencoding'` cannot hold the text, the command says so: run `:set fileencoding=utf-8` before `:w`. The command does this for a Claude session that is still connected too, and until you write or drop the text, that session's next diff on the same file fails because the buffer has unsaved changes. A diff whose file buffer already has unsaved changes, cannot be written (a `'buftype'` such as `nofile`), or refuses the text (for example a swap file from another Neovim, or `'nomodifiable'`), stays open, and the command names the reason, so neither those changes nor your accepted edits are lost. For a swap file, open the file with `:split <file>` (answer the swap file prompt if Neovim shows one), then run the command again. The command also closes a diff you rejected whose Claude session exited before it closed the diff.
 
 ## Events
 
@@ -415,7 +417,9 @@ To fully own the terminal width during diffs, set `diff_opts.auto_resize_termina
 (so the plugin applies no width policy of its own) and resize from the events yourself.
 Note this is "own the width via the events", not "freeze the width": the diff layout still
 runs `wincmd =`, which equalizes splits, so set your desired width in the `ClaudeCodeDiffOpened`
-handler — it fires after the layout is built, so it wins:
+handler — it fires after the layout is built, so it wins. When the diff closes, the windows of
+the tab it split get back the sizes they had before it (if that tab still has the same window
+layout and the same space for it), and then `ClaudeCodeDiffClosed` fires:
 
 ```lua
 vim.api.nvim_create_autocmd("User", {
@@ -1008,7 +1012,7 @@ The plugin runs the CLI through a [terminal provider](./lua/claudecode/terminal/
 ### System Verification
 
 - Run: `mise run all` (format, lint, test)
-- Run: `mise run test` (Busted suite with coverage) or one file with `busted -v tests/unit/<name>_spec.lua`
+- Run: `mise run test` (Busted suite with coverage, in a random order whose seed it prints; `BUSTED_SEED=<seed> mise run test` repeats that order, and a test registered inside a `pairs()` loop fails the run) or one file with `busted -v tests/unit/<name>_spec.lua`
 - Run: `mise run check` (Lua syntax and `luacheck` on `lua/` and `tests/`)
 - Run: `npm --prefix scripts run test:release-please-runner` (release runner, after `npm --prefix scripts ci`)
 

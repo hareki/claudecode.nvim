@@ -118,11 +118,27 @@ local function fire_diff_event(name, data)
   pcall(vim.api.nvim_exec_autocmds, "User", { pattern = name, data = data, modeline = false })
 end
 
+---Every window, the current tab's first. A diff opens where the user is, as VS Code opens it in the active editor
+---group, and goes to another tab only when this one has no window it can use.
+---@return number[] windows
+local function windows_current_tab_first()
+  local current_tab = vim.api.nvim_get_current_tabpage()
+  local here, elsewhere = {}, {}
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    local list = vim.api.nvim_win_get_tabpage(win) == current_tab and here or elsewhere
+    list[#list + 1] = win
+  end
+  for _, win in ipairs(elsewhere) do
+    here[#here + 1] = win
+  end
+  return here
+end
+
 ---Find a suitable main editor window to open diffs in.
 ---Excludes terminals, sidebars, and floating windows.
 ---@return number? win_id Window ID of the main editor window, or nil if not found
 local function find_main_editor_window()
-  local windows = vim.api.nvim_list_wins()
+  local windows = windows_current_tab_first()
 
   for _, win in ipairs(windows) do
     local buf = vim.api.nvim_win_get_buf(win)
@@ -145,6 +161,12 @@ local function find_main_editor_window()
     -- pane, or one of claudecode's own diff panes. Opening a file into one
     -- clears its window-local 'diff' and destroys that diff layout (issue #277).
     if is_suitable and vim.api.nvim_win_get_option(win, "diff") then
+      is_suitable = false
+    end
+
+    -- Skip the preview window: 'winfixheight' keeps it at its 'previewheight' lines, and the next :pedit
+    -- shows another file in it and turns off its 'diff'.
+    if is_suitable and vim.api.nvim_win_get_option(win, "previewwindow") then
       is_suitable = false
     end
 
@@ -232,8 +254,26 @@ local function find_claudecode_terminal_window()
   return floating_fallback
 end
 
----Create a split based on configured layout
+---When the preview window is current, make the Claude terminal's window current if it is a tiled window in
+---this tab. A split of the preview window shares its row, which 'winfixheight' keeps at 'previewheight' lines.
+local function leave_preview_window()
+  if not vim.api.nvim_win_get_option(vim.api.nvim_get_current_win(), "previewwindow") then
+    return
+  end
+  local terminal_win = find_claudecode_terminal_window()
+  if
+    terminal_win
+    and vim.api.nvim_win_get_tabpage(terminal_win) == vim.api.nvim_get_current_tabpage()
+    and (vim.api.nvim_win_get_config(terminal_win).relative or "") == ""
+  then
+    vim.api.nvim_set_current_win(terminal_win)
+  end
+end
+
+---Split the current window per the configured layout, or the Claude terminal's window when the preview
+---window is current (see leave_preview_window)
 local function create_split()
+  leave_preview_window()
   if config and config.diff_opts and config.diff_opts.layout == "horizontal" then
     -- Ensure the new window is created below the current one regardless of user 'splitbelow' setting
     vim.cmd("belowright split")
@@ -253,7 +293,10 @@ local function capture_window_options(win_id)
   options.number = vim.api.nvim_get_option_value("number", { win = win_id })
   options.relativenumber = vim.api.nvim_get_option_value("relativenumber", { win = win_id })
   options.signcolumn = vim.api.nvim_get_option_value("signcolumn", { win = win_id })
-  options.statuscolumn = vim.api.nvim_get_option_value("statuscolumn", { win = win_id })
+  -- Neovim 0.8 has no 'statuscolumn', and reading it there raises "unknown option".
+  if vim.fn.has("nvim-0.9") == 1 then
+    options.statuscolumn = vim.api.nvim_get_option_value("statuscolumn", { win = win_id })
+  end
   options.foldcolumn = vim.api.nvim_get_option_value("foldcolumn", { win = win_id })
 
   -- Visual options
@@ -428,6 +471,18 @@ local function is_buffer_dirty(file_path)
 
   local is_dirty = vim.api.nvim_buf_get_option(bufnr, "modified")
   return is_dirty, nil
+end
+
+---@param path string
+---@return string|nil text The file's bytes, or nil when it cannot be read
+local function read_file(path)
+  local file = io.open(path, "rb")
+  if not file then
+    return nil
+  end
+  local text = file:read("*a")
+  file:close()
+  return text
 end
 
 ---Setup the diff module
@@ -734,10 +789,10 @@ function M._open_native_diff(old_file_path, new_file_path, new_file_contents, ta
   else
     vim.cmd("wincmd t")
     vim.cmd("wincmd l")
-    local buf = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
-    local buftype = vim.api.nvim_buf_get_option(buf, "buftype")
+    local win = vim.api.nvim_get_current_win()
+    local buftype = vim.api.nvim_buf_get_option(vim.api.nvim_win_get_buf(win), "buftype")
 
-    if buftype == "terminal" or buftype == "nofile" then
+    if buftype == "terminal" or buftype == "nofile" or vim.api.nvim_win_get_option(win, "previewwindow") then
       create_split()
     end
   end
@@ -790,10 +845,118 @@ end
 ---@type table<string, table>
 local active_diffs = {}
 
+---@class DiffWindowSizes What a tab's tiled windows looked like before the first open diff split that tab.
+---@field tab integer tabpage handle
+---@field layout table the tab's winlayout(), which leaves out floating and external windows
+---@field width integer the columns the windows fill, as measure_layout counts them
+---@field height integer the rows the windows fill, counted the same way
+---@field windows { win: NvimWin, width: integer, height: integer }[] in winlayout() order
+---@field cursor_window NvimWin the window the cursor was in, in any tab, before the first diff opened
+
+---Add the size of each window in a winlayout() tree to `windows`, and return the columns and rows the tree fills,
+---leaving out separators and status lines: the same tree always has the same number of them.
+---@param node table a winlayout() node
+---@param windows { win: NvimWin, width: integer, height: integer }[]
+---@return integer width
+---@return integer height
+local function measure_layout(node, windows)
+  if node[1] == "leaf" then
+    local width, height = vim.api.nvim_win_get_width(node[2]), vim.api.nvim_win_get_height(node[2])
+    windows[#windows + 1] = { win = node[2], width = width, height = height }
+    return width, height
+  end
+  local width, height = 0, 0
+  for _, child in ipairs(node[2]) do
+    local child_width, child_height = measure_layout(child, windows)
+    if node[1] == "row" then
+      width, height = width + child_width, child_height
+    else
+      width, height = child_width, height + child_height
+    end
+  end
+  return width, height
+end
+
+---@param tab integer tabpage handle
+---@return DiffWindowSizes
+local function window_sizes_of(tab)
+  local layout = vim.fn.winlayout(vim.api.nvim_tabpage_get_number(tab))
+  local windows = {}
+  local width, height = measure_layout(layout, windows)
+  return { tab = tab, layout = layout, width = width, height = height, windows = windows }
+end
+
+---Take the sizes a diff about to split `tab` gives back when it closes. When another open diff already split that
+---tab, share its sizes: the current ones include that diff's windows.
+---@param tab integer tabpage handle
+---@return DiffWindowSizes
+local function save_window_sizes(tab)
+  assert(vim.api.nvim_tabpage_is_valid(tab), "save_window_sizes needs a valid tab")
+  for _, other in pairs(active_diffs) do
+    if other.window_sizes and other.window_sizes.tab == tab then
+      return other.window_sizes
+    end
+  end
+  local saved = window_sizes_of(tab)
+  saved.cursor_window = vim.api.nvim_get_current_win()
+  return saved
+end
+
+---Give a tab's windows back the sizes save_window_sizes took. The diff's `wincmd =` resizes every window in the tab,
+---and closing the diff's windows shares their space out by 'equalalways' rules, so without this the user's windows
+---end at other sizes. Does nothing when the tab's window tree changed (another diff's windows are still open, or the
+---user moved or added a window) or the space the windows fill changed (a resized screen, a tab line that appeared):
+---the old sizes do not fit then.
+---@param saved DiffWindowSizes|nil
+---@return boolean restored
+local function restore_window_sizes(saved)
+  if not saved or not vim.api.nvim_tabpage_is_valid(saved.tab) then
+    return false
+  end
+  local now = window_sizes_of(saved.tab)
+  if not vim.deep_equal(now.layout, saved.layout) or now.width ~= saved.width or now.height ~= saved.height then
+    return false
+  end
+  -- Twice, as winrestcmd() does: a resize can move a window that an earlier one already set.
+  for _ = 1, 2 do
+    for _, entry in ipairs(saved.windows) do
+      pcall(vim.api.nvim_win_set_width, entry.win, entry.width)
+      pcall(vim.api.nvim_win_set_height, entry.win, entry.height)
+    end
+  end
+  return true
+end
+
+---Put the cursor back in `origin`, the window it was in when the diff opened, or in `saved.cursor_window` when
+---`origin` is gone (it was another diff's window). Only when the window the cursor was in before the diff's windows
+---closed (`cursor_window`) closed with them: Neovim gives the cursor to the window that takes the space, such as the
+---Claude terminal, and a cursor the user moved to another window during the diff stays there. After a failed setup,
+---which the user cannot have moved away from, pass no `cursor_window`.
+---@param saved DiffWindowSizes|nil
+---@param origin NvimWin|nil
+---@param cursor_window NvimWin|nil
+local function restore_cursor(saved, origin, cursor_window)
+  if not saved or (cursor_window and vim.api.nvim_win_is_valid(cursor_window)) then
+    return
+  end
+  local target = (origin and vim.api.nvim_win_is_valid(origin)) and origin or saved.cursor_window
+  if vim.api.nvim_win_is_valid(target) then
+    pcall(vim.api.nvim_set_current_win, target)
+  end
+end
+
+M._save_window_sizes = save_window_sizes
+M._restore_window_sizes = restore_window_sizes
+M._restore_cursor = restore_cursor
+
+local diffs_registered = 0
+
 ---Register diff state for tracking
 ---@param tab_name string Unique identifier for the diff
 ---@param diff_data table Diff state data
 function M._register_diff_state(tab_name, diff_data)
+  diffs_registered = diffs_registered + 1
+  diff_data.open_order = diffs_registered
   active_diffs[tab_name] = diff_data
 end
 
@@ -1179,12 +1342,13 @@ function M._cleanup_diff_state(tab_name, reason)
     -- Optionally ensure the Claude terminal remains visible in the original tab
     local terminal_ok, terminal_module = pcall(require, "claudecode.terminal")
     if terminal_ok and diff_data.had_terminal_in_original then
+      -- No idle resize: the diff resized only the terminal window in its own tab, which closed with that tab, so a
+      -- terminal window that stayed open keeps its width, a width the user chose included. One that ensure_visible
+      -- has to open gets split_width_percentage from the provider.
       pcall(terminal_module.ensure_visible)
-      -- Restore the idle terminal width if it is visible (unless the user opted
-      -- out via auto_resize_terminal). Floating terminals are skipped.
-      resize_terminal_for_diff(find_claudecode_terminal_window(), "idle")
     end
   else
+    local cursor_window = vim.api.nvim_get_current_win()
     -- Close new diff window if still open (only if not in a new tab)
     if diff_data.new_window and vim.api.nvim_win_is_valid(diff_data.new_window) then
       pcall(vim.api.nvim_win_close, diff_data.new_window, true)
@@ -1211,9 +1375,13 @@ function M._cleanup_diff_state(tab_name, reason)
       end
     end
 
-    -- After closing the diff in the same tab, restore the idle terminal width
-    -- (unless the user opted out via auto_resize_terminal). Floating terminals are skipped.
-    resize_terminal_for_diff(find_claudecode_terminal_window(), "idle")
+    restore_cursor(diff_data.window_sizes, diff_data.cursor_origin, cursor_window)
+    -- A restore gives a Claude terminal in this tab its width from before the diff, a width the user chose included,
+    -- and the diff never resized one in another tab. Only a failed restore leaves the idle width to set (unless the
+    -- user opted out via auto_resize_terminal). Floating terminals are skipped.
+    if not restore_window_sizes(diff_data.window_sizes) then
+      resize_terminal_for_diff(find_claudecode_terminal_window(), "idle")
+    end
   end
 
   -- Focus can be stranded inside a config-hidden Snacks float (parked via
@@ -1281,6 +1449,8 @@ function M._setup_blocking_diff(params, resolution_callback)
   -- (the state-based cleanup is gated on a registered diff). Issue #231.
   local fallback_window = nil
   local new_buffer = nil
+  local window_sizes = nil
+  local cursor_origin = nil
   -- Same rationale for the open_in_new_tab path: display_terminal_in_new_tab() runs `:tabnew`
   -- early, so a failure before registration would strand that tab. Hoist its handle (and the tab
   -- we came from, to refocus) so the error handler can close it and switch back. Issue #262.
@@ -1364,11 +1534,17 @@ function M._setup_blocking_diff(params, resolution_callback)
         end
 
         if existing_buffer then
-          for _, win in ipairs(vim.api.nvim_list_wins()) do
+          for _, win in ipairs(windows_current_tab_first()) do
             -- Don't reuse a window that is already in diff mode (e.g. the old
             -- file shown inside the user's diffview/vimdiff): diffing into it
-            -- would join and corrupt that diff (issue #277).
-            if vim.api.nvim_win_get_buf(win) == existing_buffer and not vim.api.nvim_win_get_option(win, "diff") then
+            -- would join and corrupt that diff (issue #277). Skip the preview
+            -- window and floating windows too, as find_main_editor_window does.
+            if
+              vim.api.nvim_win_get_buf(win) == existing_buffer
+              and not vim.api.nvim_win_get_option(win, "diff")
+              and not vim.api.nvim_win_get_option(win, "previewwindow")
+              and (vim.api.nvim_win_get_config(win).relative or "") == ""
+            then
               target_window = win
               break
             end
@@ -1376,9 +1552,17 @@ function M._setup_blocking_diff(params, resolution_callback)
         end
       end
 
-      if not target_window then
-        target_window = find_main_editor_window()
+      -- A window that shows the file comes first, but not at the cost of leaving the current tab.
+      local editor_window = find_main_editor_window()
+      local current_tab = vim.api.nvim_get_current_tabpage()
+      if
+        not (target_window and vim.api.nvim_win_get_tabpage(target_window) == current_tab)
+        and editor_window
+        and vim.api.nvim_win_get_tabpage(editor_window) == current_tab
+      then
+        target_window = editor_window
       end
+      target_window = target_window or editor_window
 
       -- A Neovim diff is scoped to its tabpage: all &diff windows in a tab share
       -- one diff set. If the tab that would host Claude's diff already contains a
@@ -1391,13 +1575,18 @@ function M._setup_blocking_diff(params, resolution_callback)
       -- before registration can still close the new tab.
       local dest_tab = (target_window and vim.api.nvim_win_is_valid(target_window))
           and vim.api.nvim_win_get_tabpage(target_window)
-        or vim.api.nvim_get_current_tabpage()
-      if tabpage_has_diff_window(dest_tab) then
+        or current_tab
+      -- A user in a tab with their own diff gets Claude's diff in a new tab, which close_tab leaves for that tab,
+      -- not in another tab that they would stay in.
+      if tabpage_has_diff_window(dest_tab) or tabpage_has_diff_window(current_tab) then
         original_tab_handle = vim.api.nvim_get_current_tabpage()
         original_tab_number, terminal_win_in_new_tab, had_terminal_in_original, new_tab_handle =
           display_terminal_in_new_tab()
         created_new_tab = true
         target_window = nil
+      else
+        window_sizes = save_window_sizes(dest_tab)
+        cursor_origin = vim.api.nvim_get_current_win()
       end
     end
     -- If created_new_tab is true, target_window stays nil and will be created in the new tab.
@@ -1466,6 +1655,8 @@ function M._setup_blocking_diff(params, resolution_callback)
       target_window = diff_info.target_window,
       target_window_created_by_plugin = diff_info.target_window_created_by_plugin,
       fallback_window = fallback_window,
+      window_sizes = window_sizes,
+      cursor_origin = cursor_origin,
       original_buffer = diff_info.original_buffer,
       original_buffer_created_by_plugin = diff_info.original_buffer_created_by_plugin,
       original_cursor_pos = original_cursor_pos,
@@ -1525,6 +1716,8 @@ function M._setup_blocking_diff(params, resolution_callback)
       if new_buffer and vim.api.nvim_buf_is_valid(new_buffer) then
         pcall(vim.api.nvim_buf_delete, new_buffer, { force = true })
       end
+      restore_cursor(window_sizes, cursor_origin)
+      restore_window_sizes(window_sizes)
       -- Close the tab opened by display_terminal_in_new_tab() before registration (issue #262).
       -- That helper runs `:tabnew` (switching to the new tab) and the tab holds no user content.
       -- Prefer the returned handle; if the helper itself threw after `:tabnew`, Lua never assigned
@@ -1577,6 +1770,8 @@ end
 ---@param client_id string|nil Id of the MCP client opening the diff (so it can be cleaned up if that client disconnects)
 ---@return table response MCP-compliant response with content array
 function M.open_diff_blocking(old_file_path, new_file_path, new_file_contents, tab_name, client_id)
+  -- Absolute from here on, so a later :cd cannot point this diff at another file.
+  old_file_path = vim.fn.fnamemodify(old_file_path, ":p")
   -- Check for existing diff with same tab_name
   if active_diffs[tab_name] then
     local existing_diff = active_diffs[tab_name]
@@ -1746,15 +1941,26 @@ local function close_active_diffs(filter_fn, reason, client_id)
   -- Snapshot the tab names first: close_diff_by_tab_name nils out entries as it
   -- goes, and mutating a table while iterating it with pairs() is undefined.
   local tab_names = {}
+  local listed = {}
   for tab_name, diff_data in pairs(active_diffs) do
     if matches(diff_data) then
       tab_names[#tab_names + 1] = tab_name
+      listed[tab_name] = diff_data
     end
   end
+  -- Newest first, not in pairs() order: each close puts the cursor back where that diff opened, so the cursor ends
+  -- where it was before the oldest of them opened, whatever the tab names.
+  table.sort(tab_names, function(a, b)
+    return listed[a].open_order > listed[b].open_order
+  end)
   for _, tab_name in ipairs(tab_names) do
     -- Each close fires ClaudeCodeDiffClosed synchronously, and a user handler can
-    -- accept a later entry, so recheck the filter against the entry as it is now.
-    if matches(active_diffs[tab_name]) and M.close_diff_by_tab_name(tab_name, client_id) then
+    -- accept or reject a later entry. Recheck the filter against the entry as it is
+    -- now, so an accepted one stays. A rejected one holds no edits and has had its
+    -- answer, so it closes as it would have, unless a new diff replaced it.
+    local diff_data = active_diffs[tab_name]
+    local rejected = diff_data == listed[tab_name] and diff_data.status == "rejected"
+    if (matches(diff_data) or rejected) and M.close_diff_by_tab_name(tab_name, client_id) then
       count = count + 1
     end
   end
@@ -1768,10 +1974,10 @@ end
 ---Closes diffs in ANY state (including saved), so its only caller is the
 ---closeAllDiffTabs tool, where Claude is the connected client and has written
 ---its accepted files. A saved diff that belongs to another client stays open:
----that client has not written it yet. Automatic cleanup and the
----:ClaudeCodeCloseAllDiffs command deliberately use close_pending_diffs /
----close_diffs_for_client instead, to leave already-saved diffs alone -- see
----close_pending_diffs for why.
+---that client has not written it yet. Automatic cleanup deliberately uses
+---close_pending_diffs / close_diffs_for_client instead, to leave already-saved
+---diffs alone -- see close_pending_diffs for why. :ClaudeCodeCloseAllDiffs
+---closes saved diffs only through close_saved_diffs.
 ---@param reason string Human-readable reason (for logging)
 ---@param client_id string|nil The Claude client that called closeAllDiffTabs
 ---@return number count Number of diffs closed
@@ -1809,6 +2015,201 @@ function M.close_diffs_for_client(client_id, reason)
   return close_active_diffs(function(diff_data)
     return diff_data.client_id == client_id and diff_data.status == "pending"
   end, reason or ("client " .. tostring(client_id)))
+end
+
+---Close every rejected diff. Claude has its answer and the diff holds no edits. Claude closes it with close_tab,
+---but a client that exited first never will.
+---@param reason string Human-readable reason (for logging)
+---@return number count Number of diffs closed
+function M.close_rejected_diffs(reason)
+  return close_active_diffs(function(diff_data)
+    return diff_data.status == "rejected"
+  end, reason or "close rejected diffs")
+end
+
+---@param diff_data table A saved active_diffs entry
+---@param buf integer The file's buffer
+---@return string[] lines The accepted text as lines of that buffer
+---@return boolean eol True when the text ends with a line break
+local function accepted_lines(diff_data, buf)
+  local text = diff_data.result_content.content[2].text
+  local lines = vim.split(text, "\n", { plain = true })
+  local eol = text:sub(-1) == "\n"
+  if eol then
+    table.remove(lines)
+  end
+  -- :w ends each line of a dos buffer with CRLF and starts a 'bomb' buffer with a BOM, so the text's own CRs before
+  -- a line break and its BOM would be written twice.
+  if vim.api.nvim_buf_get_option(buf, "fileformat") == "dos" then
+    for i = 1, eol and #lines or #lines - 1 do
+      lines[i] = lines[i]:gsub("\r$", "")
+    end
+  end
+  if vim.api.nvim_buf_get_option(buf, "bomb") and lines[1]:sub(1, 3) == "\239\187\191" then
+    lines[1] = lines[1]:sub(4)
+  end
+  return lines, eol
+end
+
+---@param diff_data table A saved active_diffs entry
+---@return boolean
+local function file_holds_accepted_text(diff_data)
+  return read_file(diff_data.old_file_path) == diff_data.result_content.content[2].text
+end
+
+---@param diff_data table A saved active_diffs entry
+---@return boolean
+local function buffer_holds_accepted_text(diff_data)
+  local buf = diff_data.accepted_buffer
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return false
+  end
+  local lines, eol = accepted_lines(diff_data, buf)
+  if vim.api.nvim_buf_get_option(buf, "eol") ~= eol then
+    return false
+  end
+  local buffer_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  if #buffer_lines ~= #lines then
+    return false
+  end
+  for i, line in ipairs(lines) do
+    if buffer_lines[i] ~= line then
+      return false
+    end
+  end
+  return true
+end
+
+---Load the file into its buffer and replace the lines with the accepted text, as unsaved changes. The user's :w
+---writes them through Neovim's own write (backups, permissions, symlinks, the "changed since reading" check), and
+---:e! drops them. Neovim refuses to quit while they are unsaved.
+---@param diff_data table A saved active_diffs entry
+---@return string|nil problem Why the buffer did not get the text, or nil when it did
+local function put_accepted_text_in_buffer(diff_data)
+  local path = diff_data.old_file_path
+  local existed = vim.fn.bufexists(path) == 1
+  local buf = vim.fn.bufadd(path)
+  local was_loaded = vim.api.nvim_buf_is_loaded(buf)
+  local ok, problem = pcall(function()
+    vim.fn.bufload(buf)
+    -- A BufRead autocmd can edit the buffer while it loads, and the text would mix with those edits. A special buffer
+    -- (nofile, nowrite, acwrite, ...) cannot :w the text to this file, and Neovim can quit without asking about it.
+    if vim.api.nvim_buf_get_option(buf, "modified") then
+      return "its buffer has unsaved changes"
+    end
+    local buftype = vim.api.nvim_buf_get_option(buf, "buftype")
+    if buftype ~= "" then
+      return ("its buffer has 'buftype' %s, so :w cannot write the file"):format(buftype)
+    end
+    local lines, eol = accepted_lines(diff_data, buf)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.api.nvim_buf_set_option(buf, "eol", eol)
+    if not eol then
+      -- Only the accepted text keeps its missing final line break. The user's later writes get 'fixeol' back.
+      local fixeol = vim.api.nvim_buf_get_option(buf, "fixeol")
+      vim.api.nvim_buf_set_option(buf, "fixeol", false)
+      -- `once` would delete only the event that fired, so the other one would reset 'fixeol' again later.
+      local restore_fixeol
+      restore_fixeol = vim.api.nvim_create_autocmd({ "BufWritePost", "BufReadPost" }, {
+        buffer = buf,
+        callback = function()
+          vim.api.nvim_del_autocmd(restore_fixeol)
+          vim.api.nvim_buf_set_option(buf, "fixeol", fixeol)
+        end,
+      })
+    end
+    vim.api.nvim_buf_set_option(buf, "buflisted", true)
+    -- The diff's cleanup can close this buffer's last window, and these values would drop the unsaved text with it.
+    local bufhidden = vim.api.nvim_buf_get_option(buf, "bufhidden")
+    if bufhidden == "wipe" or bufhidden == "delete" or bufhidden == "unload" then
+      vim.api.nvim_buf_set_option(buf, "bufhidden", "hide")
+    end
+  end)
+  if ok then
+    if not problem then
+      diff_data.accepted_buffer = buf
+    end
+    return problem
+  end
+  if not was_loaded then
+    -- Leave no buffer behind that failed to load or refused the text: wipe the one bufadd made, unload the one
+    -- bufload loaded. A loaded buffer would also skip the swap file check (E325) on the next run.
+    pcall(vim.api.nvim_buf_delete, buf, { force = true, unload = existed })
+  end
+  -- An API error carries the Lua position of this call, which tells the user nothing.
+  problem = tostring(problem):gsub("^.-:%d+: ", ""):gsub("^Vim:", "")
+  if problem:match("^E325:") then
+    -- Neovim deals with a swap file only when the user opens the file: it asks, or, from 0.10 on, it skips the swap
+    -- file of a running Neovim by default.
+    -- The user is in the diff window, whose modified buffer :e cannot leave (E37) in the unified layout, so split.
+    problem = (
+      "%s. Another Neovim may be editing the file: open it with :split %s (answer the swap file prompt if Neovim "
+      .. "shows one), then run the command again"
+    ):format(problem, vim.fn.fnameescape(vim.fn.fnamemodify(path, ":~:.")))
+  end
+  return problem
+end
+
+---@param diff_data table A saved active_diffs entry whose accepted_buffer holds the accepted text
+---@return {path: string, write: string, fileencoding: string|nil} unsaved
+local function describe_unsaved(diff_data)
+  local buf = diff_data.accepted_buffer
+  local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+  local fenc = vim.api.nvim_buf_get_option(buf, "fileencoding")
+  -- :w converts the text to 'fileencoding', and writes a replacement for each character that encoding lacks.
+  local lossy = fenc ~= ""
+    and fenc ~= "utf-8"
+    and vim.fn.iconv(vim.fn.iconv(text, "utf-8", fenc), fenc, "utf-8") ~= text
+  -- :w fails in a read-only buffer (E45), and :w! skips the "changed since reading" check, so check first.
+  local readonly = vim.api.nvim_buf_get_option(buf, "readonly")
+  local bang = readonly and "!" or ""
+  local write = ":w" .. bang
+  if vim.fn.isdirectory(vim.fn.fnamemodify(diff_data.old_file_path, ":h")) == 0 then
+    -- Neovim 0.8 has no :w ++p.
+    write = vim.fn.has("nvim-0.9") == 1 and (":w%s ++p"):format(bang)
+      or (":call mkdir(expand('%%:p:h'), 'p') | w%s"):format(bang)
+  end
+  if readonly then
+    write = ":checktime, then " .. write
+  end
+  return { path = diff_data.old_file_path, write = write, fileencoding = lossy and fenc or nil }
+end
+
+---Close every diff the user accepted, once its accepted text is on disk or in the file's buffer. The plugin never
+---writes the file: when the file does not hold the text yet (its Claude client exited, or dropped the answer, before
+---it wrote the file), the text goes into the file's buffer as unsaved changes, in that buffer's 'fileformat' and
+---'bomb'. A diff whose file buffer cannot take the text, for example because it already has unsaved changes, stays
+---open, so neither those changes nor the accepted text are lost.
+---@param reason string Human-readable reason (for logging)
+---@return number count Number of diffs closed
+---@return {path: string, write: string, fileencoding: string|nil}[] unsaved The files whose buffer now holds the
+---accepted text as unsaved changes, the command that writes it, and the buffer's 'fileencoding' if it cannot hold it
+---@return {path: string, why: string}[] kept The files of the saved diffs that stay open, and why
+function M.close_saved_diffs(reason)
+  local unsaved = {}
+  local problems = {}
+  for _, diff_data in pairs(active_diffs) do
+    if diff_data.status == "saved" and not file_holds_accepted_text(diff_data) then
+      problems[diff_data] = put_accepted_text_in_buffer(diff_data)
+      if not problems[diff_data] then
+        unsaved[#unsaved + 1] = describe_unsaved(diff_data)
+      end
+    end
+  end
+  local count = close_active_diffs(function(diff_data)
+    return diff_data.status == "saved"
+      and (file_holds_accepted_text(diff_data) or buffer_holds_accepted_text(diff_data))
+  end, reason or "close saved diffs")
+  local kept = {}
+  for _, diff_data in pairs(active_diffs) do
+    if diff_data.status == "saved" then
+      kept[#kept + 1] = {
+        path = diff_data.old_file_path,
+        why = problems[diff_data] or "it changed while the command ran, so run the command again",
+      }
+    end
+  end
+  return count, unsaved, kept
 end
 
 ---Test helper function (only for testing)
@@ -1881,6 +2282,7 @@ end
 -- Expose internal utilities for use by diff_inline.lua
 M._find_main_editor_window = find_main_editor_window
 M._find_claudecode_terminal_window = find_claudecode_terminal_window
+M._leave_preview_window = leave_preview_window
 M._is_buffer_dirty = is_buffer_dirty
 M._detect_filetype = detect_filetype
 M._get_autocmd_group = get_autocmd_group

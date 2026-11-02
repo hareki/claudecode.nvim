@@ -1,5 +1,6 @@
 -- luacheck: globals expect
 require("tests.busted_setup")
+local temp_dir = require("tests.helpers.temp_dir")
 
 describe("Diff Module", function()
   local diff
@@ -218,9 +219,7 @@ describe("Diff Module", function()
       -- Models real Neovim on POSIX: mkdir and delete act on disk, and delete(path, "d") removes only an empty directory.
       before_each(function()
         old_time = os.time
-        root = os.tmpname()
-        os.remove(root)
-        assert(sh("mkdir -p '" .. root .. "'"))
+        root = temp_dir.new()
         for _, name in ipairs({ "stdpath", "mkdir", "delete", "isdirectory", "fnamemodify", "getpid", "tempname" }) do
           original_vim_functions["fn." .. name] = vim.fn[name]
         end
@@ -235,14 +234,14 @@ describe("Diff Module", function()
           return root
         end
         vim.fn.mkdir = function(path)
-          return sh("mkdir -p '" .. path .. "'") and 1 or 0
+          return sh("mkdir -p " .. temp_dir.quote(path)) and 1 or 0
         end
         vim.fn.isdirectory = function(path)
-          return sh("test -d '" .. path .. "'") and 1 or 0
+          return sh("test -d " .. temp_dir.quote(path)) and 1 or 0
         end
         vim.fn.delete = function(path, flags)
           if flags == "rf" then
-            return sh("rm -rf '" .. path .. "'") and 0 or -1
+            return sh("rm -rf " .. temp_dir.quote(path)) and 0 or -1
           end
           return os.remove(path) and 0 or -1
         end
@@ -250,7 +249,7 @@ describe("Diff Module", function()
 
       after_each(function()
         rawset(os, "time", old_time)
-        sh("rm -rf '" .. root .. "'")
+        temp_dir.remove(root)
       end)
 
       it("removes the folder without a notification when the proposed buffer closes", function()
@@ -490,6 +489,24 @@ describe("Diff Module", function()
   end)
 
   describe("Dirty Buffer Detection", function()
+    -- These tests replace functions on the shared vim mock. Record them so teardown() restores them.
+    before_each(function()
+      for _, path in ipairs({
+        "fn.filereadable",
+        "fn.bufnr",
+        "api.nvim_list_bufs",
+        "api.nvim_list_wins",
+        "api.nvim_buf_get_option",
+        "api.nvim_create_buf",
+        "api.nvim_buf_set_name",
+        "api.nvim_buf_set_lines",
+        "api.nvim_set_option_value",
+      }) do
+        local scope, name = path:match("^(%a+)%.(.+)$")
+        original_vim_functions[path] = vim[scope][name]
+      end
+    end)
+
     it("should detect clean buffer", function()
       -- Mock vim.fn.bufnr to return a valid buffer number
       local old_bufnr = _G.vim.fn.bufnr

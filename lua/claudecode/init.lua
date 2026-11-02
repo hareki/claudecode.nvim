@@ -512,11 +512,13 @@ function M.start(show_startup_notification)
   local success, result = server.start(M.state.config, auth_token)
 
   if not success then
-    local error_msg = "Failed to start Claude Code server: " .. (result or "unknown error")
+    local error_msg = "Server not started: " .. (result or "unknown error")
     if result and result:find("auth") then
       error_msg = error_msg .. " (authentication related)"
     end
-    logger.error("init", error_msg)
+    -- auto_start runs this while Neovim starts, where a line wider than the command line waits for a key. The reason
+    -- alone (for example "No free port in 10000-65535 (EADDRINUSE)") fits at 80 columns and says what failed.
+    logger.one_line("error", "init", result or "Server not started")
     return false, error_msg
   end
 
@@ -1155,19 +1157,45 @@ function M._create_commands()
   })
 
   vim.api.nvim_create_user_command("ClaudeCodeCloseAllDiffs", function()
-    -- Pending only: a status="saved" diff holds the user's :w'd edits in its
-    -- proposed buffer until Claude writes the file, and closing it would discard
-    -- them (same data-loss branch the auto-cleanup avoids). So this clears
-    -- orphaned proposals but leaves accepted diffs for the user to handle.
+    -- A status="saved" diff holds the user's :w'd edits in its proposed buffer
+    -- until the file holds them, so only close_saved_diffs, which first moves
+    -- them into the file's buffer, may close it.
     local diff = require("claudecode.diff")
-    local count = diff.close_pending_diffs("user command")
-    if count > 0 then
-      vim.notify(("Closed %d pending Claude diff(s)"):format(count), vim.log.levels.INFO)
-    else
-      vim.notify("No pending Claude diffs to close", vim.log.levels.WARN)
+    local pending = diff.close_pending_diffs("user command")
+    local rejected = diff.close_rejected_diffs("user command")
+    local saved, unsaved, kept = diff.close_saved_diffs("user command")
+    if pending > 0 then
+      vim.notify(("Closed %d pending Claude diff(s)"):format(pending), vim.log.levels.INFO)
+    end
+    if rejected > 0 then
+      vim.notify(("Closed %d rejected Claude diff(s)"):format(rejected), vim.log.levels.INFO)
+    end
+    if saved > #unsaved then
+      vim.notify(
+        ("Closed %d accepted Claude diff(s). Their files hold the accepted text."):format(saved - #unsaved),
+        vim.log.levels.INFO
+      )
+    end
+    for _, entry in ipairs(unsaved) do
+      local msg = ("The accepted Claude edits for %s are in its buffer, not saved: "):format(
+        vim.fn.fnamemodify(entry.path, ":~:.")
+      )
+      if entry.fileencoding then
+        msg = msg .. (":set fileencoding=utf-8 (%s cannot hold them), then "):format(entry.fileencoding)
+      end
+      vim.notify(msg .. ("%s writes them, :e! drops them"):format(entry.write), vim.log.levels.WARN)
+    end
+    for _, entry in ipairs(kept) do
+      vim.notify(
+        ("Kept the accepted Claude diff for %s: %s"):format(vim.fn.fnamemodify(entry.path, ":~:."), entry.why),
+        vim.log.levels.WARN
+      )
+    end
+    if pending + rejected + saved + #kept == 0 then
+      vim.notify("No Claude diffs to close", vim.log.levels.WARN)
     end
   end, {
-    desc = "Close pending Claude Code diffs (leaves accepted/saved diffs intact)",
+    desc = "Close Claude Code diffs: reject pending ones, close rejected ones, and close accepted ones once the file or its buffer holds the accepted text",
   })
 
   vim.api.nvim_create_user_command("ClaudeCodeSelectModel", function(opts)
