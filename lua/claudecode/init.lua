@@ -232,6 +232,19 @@ local function flush_mention_queue()
   end
 
   local mention = queue[1]
+  -- Mentions queued before Claude's last handshake stay on at_mentioned (see claudecode.mention_paste). They are the
+  -- oldest ones, so once the oldest is not one of them, the whole queue goes out as one paste.
+  if
+    not mention.queued_before_handshake
+    and M.is_claude_connected()
+    and require("claudecode.mention_paste").paste(queue)
+  then
+    logger.debug("queue", "Pasted " .. #queue .. " queued @ mentions into the Claude terminal")
+    M.state.mention_queue = {}
+    schedule_mention_flush(debounce_delay)
+    return
+  end
+
   local params = { filePath = mention.file_path, lineStart = mention.start_line, lineEnd = mention.end_line }
   if not server.broadcast("at_mentioned", params, report_unwritten("queue", mention.file_path)) then
     -- No connected client took the frame, as Claude went away since this flush was scheduled. The mention waits for
@@ -282,6 +295,9 @@ end
 ---@param from_new_connection boolean|nil true after a handshake; otherwise the queue flushes now
 function M.process_mention_queue(from_new_connection)
   if from_new_connection then
+    for _, mention in ipairs(mention_queue()) do
+      mention.queued_before_handshake = true
+    end
     schedule_mention_flush(M.state.config.connection_wait_delay)
   else
     flush_mention_queue()
@@ -1382,6 +1398,9 @@ function M._broadcast_at_mention(file_path, start_line, end_line)
   local immediate = (M.state.config and M.state.config.disable_broadcast_debouncing)
     or (package.loaded["busted"] and not (M.state.config and M.state.config.enable_broadcast_debouncing_in_tests))
   if immediate and #mention_queue() == 0 and (ms_until_a_client_is_ready() or 0) == 0 then
+    if require("claudecode.mention_paste").paste({ sent }) then
+      return true, nil, sent
+    end
     local broadcast_success =
       M.state.server.broadcast("at_mentioned", params, report_unwritten("command", formatted_path))
     if broadcast_success then
