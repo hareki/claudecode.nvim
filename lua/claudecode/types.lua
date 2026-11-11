@@ -60,6 +60,7 @@
 ---@field start_line number? Optional start line (0-indexed for Claude compatibility)
 ---@field end_line number? Optional end line (0-indexed for Claude compatibility)
 ---@field deadline number When the queue clears the mention with an error (vim.loop.now() time)
+---@field queued_before_handshake boolean? Queued when a Claude handshake came in, so it is not pasted (mention_paste)
 
 -- Payload delivered as `data` to a `User ClaudeCodeSendComplete` autocmd. Fired
 -- once per file, synchronously, when a send is accepted while Claude is connected.
