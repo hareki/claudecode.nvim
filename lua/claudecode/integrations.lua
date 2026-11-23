@@ -18,6 +18,8 @@ function M.get_selected_files_from_tree()
     return M._get_oil_selection()
   elseif current_ft == "minifiles" then
     return M._get_mini_files_selection()
+  elseif current_ft == "trouble" then
+    return require("claudecode.trouble").files()
   elseif current_ft == "netrw" then
     return M._get_netrw_selection()
   elseif current_ft == "snacks_picker_list" then

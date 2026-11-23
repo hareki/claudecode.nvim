@@ -206,6 +206,8 @@ function M.get_tree_state()
     end
 
     return oil, "oil"
+  elseif current_ft == "trouble" then
+    return require("claudecode.trouble"), "trouble"
   elseif current_ft == "netrw" then
     return { curdir = vim.b.netrw_curdir }, "netrw"
   else
@@ -411,6 +413,8 @@ function M.get_files_from_visual_selection(visual_data)
       end
     end
     files = unique_files
+  elseif tree_type == "trouble" then
+    return tree_state.files(start_pos, end_pos)
   elseif tree_type == "oil" then
     local oil = tree_state
     local bufnr = vim.api.nvim_get_current_buf()

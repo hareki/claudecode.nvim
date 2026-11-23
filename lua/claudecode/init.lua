@@ -825,6 +825,7 @@ function M._create_commands()
     local is_tree_buffer = current_ft == "NvimTree"
       or current_ft == "neo-tree"
       or current_ft == "oil"
+      or current_ft == "trouble"
       or current_ft == "minifiles"
       or current_ft == "netrw"
       or current_ft == "snacks_picker_list"
@@ -879,6 +880,7 @@ function M._create_commands()
     local is_tree_buffer = current_ft == "NvimTree"
       or current_ft == "neo-tree"
       or current_ft == "oil"
+      or current_ft == "trouble"
       or current_ft == "minifiles"
       or current_ft == "netrw"
 
