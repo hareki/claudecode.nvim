@@ -42,6 +42,9 @@ end
 ---@param config table The merged plugin config
 local function check_cli(config)
   local terminal_cmd = config.terminal_cmd
+  if type(terminal_cmd) == "function" then
+    terminal_cmd = terminal_cmd()
+  end
   local cmd = (terminal_cmd and terminal_cmd ~= "") and terminal_cmd or "claude"
   local exe = executable_of(cmd)
 

@@ -69,7 +69,10 @@ function M.validate(config)
 
   assert(type(config.auto_start) == "boolean", "auto_start must be a boolean")
 
-  assert(config.terminal_cmd == nil or type(config.terminal_cmd) == "string", "terminal_cmd must be nil or a string")
+  assert(
+    config.terminal_cmd == nil or type(config.terminal_cmd) == "string" or type(config.terminal_cmd) == "function",
+    "terminal_cmd must be nil, a string or a function"
+  )
 
   -- Validate terminal config
   assert(type(config.terminal) == "table", "terminal must be a table")

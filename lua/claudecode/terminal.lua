@@ -357,6 +357,10 @@ end
 local function get_claude_command_and_env(cmd_args)
   -- Inline get_claude_command logic
   local cmd_from_config = defaults.terminal_cmd
+  -- A function is asked on every call, and every open and toggle makes one: only a start runs the command.
+  if type(cmd_from_config) == "function" then
+    cmd_from_config = cmd_from_config()
+  end
   local base_cmd
   if not cmd_from_config or cmd_from_config == "" then
     base_cmd = "claude" -- Default if not configured
@@ -432,7 +436,7 @@ end
 ---Configures the terminal module.
 ---Merges user-provided terminal configuration with defaults and sets the terminal command.
 ---@param user_term_config ClaudeCodeTerminalConfig? Configuration options for the terminal.
----@param p_terminal_cmd string? The command to run in the terminal (from main config).
+---@param p_terminal_cmd string|(fun(): string?)|nil The command to run in the terminal (from main config).
 ---@param p_env table? Custom environment variables to pass to the terminal (from main config).
 function M.setup(user_term_config, p_terminal_cmd, p_env)
   if user_term_config == nil then -- Allow nil, default to empty table silently
@@ -442,7 +446,7 @@ function M.setup(user_term_config, p_terminal_cmd, p_env)
     user_term_config = {}
   end
 
-  if p_terminal_cmd == nil or type(p_terminal_cmd) == "string" then
+  if p_terminal_cmd == nil or type(p_terminal_cmd) == "string" or type(p_terminal_cmd) == "function" then
     defaults.terminal_cmd = p_terminal_cmd
   else
     vim.notify(

@@ -94,7 +94,7 @@
 ---@field diff_split_width_percentage number? -- optional terminal width while a diff is active; defaults to split_width_percentage
 ---@field provider ClaudeCodeTerminalProviderName|ClaudeCodeTerminalProvider
 ---@field show_native_term_exit_tip boolean
----@field terminal_cmd string?
+---@field terminal_cmd string|(fun(): string?)|nil
 ---@field provider_opts ClaudeCodeTerminalProviderOptions?
 ---@field auto_close boolean
 ---@field auto_insert boolean -- auto-enter terminal mode when the plugin opens/focuses the Claude terminal; snacks also on any window focus, native not on <C-w>l, except after a new-tab diff put the terminal in its tab and until that window closes (#232); false keeps Normal mode + scroll position
@@ -121,7 +121,7 @@
 ---@class ClaudeCodeConfig
 ---@field port_range ClaudeCodePortRange
 ---@field auto_start boolean
----@field terminal_cmd string|nil
+---@field terminal_cmd string|(fun(): string?)|nil -- a function is asked whenever the command is built: on every open and toggle
 ---@field env table<string, string>
 ---@field log_level ClaudeCodeLogLevel
 ---@field track_selection boolean
